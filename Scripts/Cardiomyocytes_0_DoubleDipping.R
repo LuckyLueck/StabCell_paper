@@ -5,7 +5,7 @@ library(dplyr)
 
 options(future.globals.maxSize=10 * 1024^3) # Increase max allowed size (10 GB) for SCTransform
 
-# Load data (Download from GEO Database, Accession No. GSE175634)
+# Load data (Download from GEO Database if required, Accession No. GSE175634)
 data_dir <- "data/cardiomyocyte_differentiation/"
 results_dir <- "results/cardiomyocyte_differentiation/"
 

@@ -1,3 +1,9 @@
+setwd("/mnt/mikasa_data/nlueck/StabCell_paper")
+Sys.setenv(
+  RETICULATE_ENABLE_PYTHON_FINALIZER="yes",
+  MPLBACKEND="Agg"
+)
+
 library(RhpcBLASctl)
 library(doFuture)
 library(doRNG)
@@ -8,20 +14,36 @@ library(dplyr)
 library(splatter)
 library(Seurat)
 library(countsplit)
-library(StabCell)
+library(ClusterDE)
+# library(ZINBMM) # slightly modified version to also return beta coefficient matrix and beta_global vector
 
+library(StabCell)
+source("Scripts/helpers/cluster_fn.R")
+source("Scripts/helpers/marker_fn.R")
+source("Scripts/helpers/utils.R")
 
 
 ################
 #### config ####
 ################
-blas_threads <- 8
-num_workers <- 40
+options(
+  future.globals.maxSize=16 * 1024^3,
+  nwarnings=500000
+)
 
-options(future.globals.maxSize=16 * 1024^3)
+# set up python venv if not exists
+if(!reticulate::virtualenv_exists("./.venv")){
+  reticulate::virtualenv_create(
+    "./.venv",
+    version="3.12",
+    packages=c("numpy", "pandas", "scipy", "matplotlib", "scikit-learn", "joblib", "truncated_normal")
+  )
+}
 
-blas_set_num_threads(blas_threads)
-plan(multicore, workers=num_workers)
+blas_threads <- 4
+num_workers <- 50
+
+plan(multisession, workers=num_workers)
 registerDoFuture()
 
 seed <- 08052025
@@ -31,32 +53,32 @@ set_scenario_settings <- function(scenario){
   if(scenario == "2Cluster_Simulation"){
     n_celltypes <<- c(1, 2)
     n_clusters <<- 2  # always find 2 clusters when clustering
-    test_local <<- FALSE  # local & global are the same for 2 cell types!
   } else if(scenario == "NCluster_Simulation") {
     n_celltypes <<- c(1, 10)
     n_clusters <<- NULL # no restriction on clusters to be found
-    test_local <<- TRUE
   } else {
     stop("Unknown scenario!")
   }
 }
 
+n_cells <- 5000
+n_genes <- 10000
+
 repetitions <- 100
 fixed_num_subsample_markers <- FALSE
 
-subsampling_fraction <- 0.5
 subsampling_iterations <- 50
-complementary_pairs <- TRUE
 PFER_max <- c(1, 5, 10, 25, 50, 100)
 cell_stability_metric <- c("gini", "entropy", "L2norm")[1]
 
 de.probs <- c(0.01, 0.05)   # larger values --> less sparse
 de.facLocs <- c(0.1, 0.4)   # larger value --> stronger differences between cell types
-lib.locs <- c(9.3, 10.3, 11.) # ~10k/25k/50k reads per cell, default: lib.loc=11
-# hist(colSums(counts(splatSimulate(newSplatParams(batchCells=5000, nGenes=100, lib.loc=11)))))
-# exp(c(9.3, 10.3, 11) + 0.2 / 2)
-# log(c(10000, 25000, 50000)) - 0.2 / 2
+lib.scale <- 0.2
+lib.size <- c(10000, 25000, 50000)
 
+
+
+marker_args <- NULL
 
 if(fixed_num_subsample_markers){
   n_subsample_markers <- c(10, 25, 50, 100, 250, 500)
@@ -65,95 +87,6 @@ if(fixed_num_subsample_markers){
   n_subsample_markers <- NULL
   p_value_threshold <- c(0.01, 0.05, 0.1)
 }
-
-
-
-
-# define function which will find N clusters by iteratively adapting resolution
-FindNClusters <- function(obj, n_clusters=NULL, initial_resolution=0.8, max_iter=100, resolution_lower_bound=0.0, resolution_upper_bound=Inf){
-  if(is.null(n_clusters)){
-    return(FindClusters(obj, verbose=FALSE))
-  }
-
-  resolution <- initial_resolution
-  for(i in 1:max_iter){
-    temp_seurat_obj <- FindClusters(obj, resolution=resolution, verbose=FALSE)
-    temp_idents <- Idents(temp_seurat_obj)
-    n_idents <- length(unique(temp_idents))
-
-    if(n_idents == n_clusters){
-      break
-    } else if(n_idents < n_clusters){
-      # increase resolution
-      resolution_lower_bound <- resolution
-      resolution <- ifelse(
-        is.infinite(resolution_upper_bound),
-        resolution * 2,
-        (resolution + resolution_upper_bound) / 2
-      )
-    } else {
-      # decrease resolution
-      resolution_upper_bound <- resolution
-      resolution <- resolution <- ifelse(
-        resolution_lower_bound == 0.,
-        resolution / 2,
-        (resolution + resolution_lower_bound) / 2
-      )
-    }
-  }
-
-  if(i == max_iter){
-    warn(paste0(
-      "Could not find ", n_clusters, " in ", max_iter, " iterations.\n",
-      "Current resolution = ", resolution, " with bounds (", resolution_lower_bound, ", ", resolution_upper_bound, ").\n",
-      "Current number of clusters is ", n_idents, "."
-    ))
-  }
-
-  return(temp_seurat_obj)
-}
-
-cluster_fn <- function(data, subsample_indices, cluster_args=NULL){
-  seurat_obj <- CreateSeuratObject(counts=data)
-  seurat_obj <- NormalizeData(seurat_obj, verbose=FALSE)
-  seurat_obj <- FindVariableFeatures(seurat_obj, verbose=FALSE)
-  seurat_obj <- ScaleData(seurat_obj, verbose=FALSE)
-  seurat_obj <- RunPCA(seurat_obj, verbose=FALSE)
-  seurat_obj <- FindNeighbors(seurat_obj, verbose=FALSE)
-  seurat_obj <- FindNClusters(seurat_obj, n_clusters=n_clusters)
-  identities <- Idents(seurat_obj)
-  return(identities)
-}
-
-test_fn <- function(data, identities, weights, test_id1, test_id2=NULL, test_args=NULL){
-  # cannot test cluster against itself
-  # --> check for cluster collision
-  if((!is.null(test_id2)) && (test_id1 == test_id2)){
-    p_values <- rep(1., nrow(data))
-    names(p_values) <- rownames(data)
-    return(p_values)
-  } else {
-    # prepare seurat object
-    seurat_obj <- CreateSeuratObject(counts=data)
-    seurat_obj <- NormalizeData(seurat_obj, verbose=FALSE)
-    Idents(seurat_obj) <- identities
-
-    markers <- FindMarkers(
-      seurat_obj, ident.1=test_id1, ident.2=test_id2, test.use="wilcox",
-      logfc.threshold=0.0, min.pct=0., # no pre-selection of genes
-      verbose=FALSE
-    )
-
-    # format results
-    p_values <- markers$p_val_adj
-    names(p_values) <- rownames(markers)
-  }
-
-  return(p_values)
-}
-
-
-
 
 
 
@@ -173,7 +106,7 @@ with_progress({
     # construct grid with simulation parameters
     sim_grid <- expand.grid(
       n_celltypes=n_celltypes,
-      lib.loc=lib.locs,
+      lib.size=lib.size,
       de.prob=de.probs,
       de.facLoc=de.facLocs,
       iter=1:repetitions
@@ -183,19 +116,16 @@ with_progress({
         # --> only 1 parameter set required
         !(n_celltypes == 1 & (de.prob != de.probs[1] | de.facLoc != de.facLocs[1]))
       ) %>%
-      arrange(n_celltypes, lib.loc, de.facLoc, de.prob, iter) %>%
+      arrange(desc(n_celltypes), lib.size, de.facLoc, de.prob, iter) %>%
       mutate(setting=paste(
         paste0("celltypes=", n_celltypes),
-        ifelse(complementary_pairs, "complementary", "subsampling"),
-        paste0("iter=", subsampling_iterations),
-        paste0("lib.loc=", lib.loc),
+        paste0("lib.size=", lib.size),
         paste0("de.prob=", de.prob),
         paste0("de.facLoc=", de.facLoc),
-        paste0("subsampling=", subsampling_fraction),
         paste0("iter=", iter),
         sep="__"
       ))
-
+    
     cat("total number of scenario settings:", nrow(sim_grid), "\n")
 
     # remove settings that have been run before
@@ -206,25 +136,34 @@ with_progress({
 
     if(nrow(sim_grid) == 0) next
 
-
+    if(reticulate::py_available(initialize=FALSE)){
+      stop("Python started before parallelization!")
+    }
+    
     p <- progressor(steps=nrow(sim_grid))
-
     foreach(
       i=1:nrow(sim_grid),
       .combine="bind_rows",
-      .export="StabCell"
+      .export="StabCell",
+      .options.future=list(chunk.size=1) # one task at a time for better workload balancing
     ) %dorng% {
-
+      
+      blas_set_num_threads(blas_threads)
+      omp_set_num_threads(blas_threads)
+      
       # no parallelization within the simulation setting (but resore old plan)
-      on.exit(plan(plan()), add=TRUE)
+      old_plan <- plan()
+      on.exit(plan(old_plan), add=TRUE)
       plan(sequential)
 
 
       de.prob <- sim_grid[i, "de.prob"]
       de.facLoc <- sim_grid[i, "de.facLoc"]
       n_celltypes <- sim_grid[i, "n_celltypes"]
-      lib.loc <- sim_grid[i, "lib.loc"]
+      lib.size <- sim_grid[i, "lib.size"]
       iter <- sim_grid[i, "iter"]
+      
+      cluster_args <- list(n_clusters=n_clusters)
 
       setting <- sim_grid[i, "setting"]
 
@@ -237,20 +176,21 @@ with_progress({
       #### simulate data ####
       #######################
       {
+        t_start <- Sys.time()
         params <- newSplatParams(
           # see: https://bioconductor.org/packages/release/bioc/vignettes/splatter/inst/doc/splat_params.html
 
           seed=seed + iter,
 
-          nGenes=10000,
-          batchCells=5000,
+          nGenes=n_genes,
+          batchCells=n_cells,
 
           # cell types
           group.prob=rep(1. / n_celltypes, n_celltypes),
 
           # library size (= counts per cell)
-          lib.loc=lib.loc,
-          lib.scale=0.2,
+          lib.loc=log(lib.size) - lib.scale^2 / 2,
+          lib.scale=lib.scale,
 
           # dropout probabilities
           dropout.type="experiment", # options: "none", "experiment", "batch, "group", "cell"
@@ -270,17 +210,64 @@ with_progress({
           method="groups",
           verbose=FALSE
         )
-        count_data <- counts(sim)
-        count_data <- as(count_data, "CsparseMatrix")
+        count_data <- as(counts(sim), "CsparseMatrix")
+        # assay(sim, "Dropout")
 
         true_idents <- as.numeric(substr(colData(sim)$Group, 6, 10))
         if(length(true_idents) == 0){
           true_idents <- rep(1, ncol(count_data))
         }
         true_fold_changes <- as.data.frame(rowData(sim)[startsWith(colnames(rowData(sim)), "DEFacGroup")])
+        # cat("Simulation:", format(Sys.time() - t_start), "\n")
       }
-      # cat("simulation finished")
-      # print(Sys.time())
+
+      
+      
+      ################################################################################
+      ################################################################################
+      ####                                                                        ####
+      ####                              Oracle Markers                            ####
+      ####                                                                        ####
+      ################################################################################
+      ################################################################################
+      {
+        t_start <- Sys.time()
+        
+        # marker detection with true idents
+        unique_true_idents <- unique(true_idents)
+        if(length(unique_true_idents) > 1){
+          df_list <- list()
+          for(oracle_id in unique_true_idents){
+            oracle_cluster_markers <- marker_fn(
+              data=count_data,
+              identities=true_idents,
+              weights=NULL,
+              cluster_id1=oracle_id,
+              cluster_id2=NULL,
+              marker_args=marker_args
+            )
+            df_list[[length(df_list)+1]] <- data.frame(
+              cluster1=oracle_id,
+              cluster2=NA,
+              marker=names(oracle_cluster_markers),
+              pval=oracle_cluster_markers
+            )
+          }
+
+          oracle_markers <- bind_rows(df_list)
+          rownames(oracle_markers) <- NULL
+        } else {
+          oracle_markers <- data.frame(
+            cluster1=unique_true_idents,
+            cluster2=NA,
+            marker=rownames(count_data),
+            pval=1
+          )
+        }
+        # cat("Oracle:", format(Sys.time() - t_start), "\n")
+      }
+
+
 
       ################################################################################
       ################################################################################
@@ -290,49 +277,36 @@ with_progress({
       ################################################################################
       ################################################################################
       {
-        seurat_obj <- CreateSeuratObject(counts=count_data)
-        seurat_obj <- NormalizeData(seurat_obj, verbose=FALSE)
-        seurat_obj <- FindVariableFeatures(seurat_obj, verbose=FALSE)
-        seurat_obj <- ScaleData(seurat_obj, verbose=FALSE)
-        seurat_obj <- RunPCA(seurat_obj, verbose=FALSE)
-        seurat_obj <- FindNeighbors(seurat_obj, verbose=FALSE)
-        seurat_obj <- FindNClusters(seurat_obj, n_clusters=n_clusters)
+        t_start <- Sys.time()
+        
+        # clustering
+        ddip_idents <- cluster_fn(data=count_data, subsample_indices=NULL, cluster_args=cluster_args)
 
-        seurat_cluster_ids <- levels(Idents(seurat_obj))
+        # marker detection
         df_list <- list()
-        for(i in seq_along(seurat_cluster_ids)){
-          for(j in seq_along(seurat_cluster_ids)){
-
-            test_id1 <- seurat_cluster_ids[i]
-
-            if(j < i){
-              next
-            } else if(i == j){
-              test_id2 <- NULL
-            } else{
-              test_id2 <- seurat_cluster_ids[j]
-            }
-
-            markers <- FindMarkers(
-              seurat_obj, ident.1=test_id1, ident.2=test_id2, test.use="wilcox",
-              logfc.threshold=0.0, min.pct=0. # no pre-selection of genes
-            )
-
-            markers$cluster1 <- test_id1
-            markers$cluster2 <- if(is.null(test_id2)) NA else test_id2
-            markers$marker <- rownames(markers)
-            rownames(markers) <- NULL
-
-            df_list[[length(df_list)+1]] <- markers
-          }
+        for(ddip_id in levels(ddip_idents)){
+          ddip_cluster_markers <- marker_fn(
+            data=count_data,
+            identities=ddip_idents,
+            weights=NULL,
+            cluster_id1=ddip_id,
+            cluster_id2=NULL,
+            marker_args=marker_args
+          )
+          df_list[[length(df_list)+1]] <- data.frame(
+            cluster1=ddip_id,
+            cluster2=NA,
+            marker=names(ddip_cluster_markers),
+            pval=ddip_cluster_markers
+          )
         }
 
-        double_dipping_markers <- bind_rows(df_list)
-        seurat_idents <- Idents(seurat_obj)
-
+        ddip_markers <- bind_rows(df_list)
+        rownames(ddip_markers) <- NULL
+        # cat("DDip:", format(Sys.time() - t_start), "\n")
       }
-      # cat("ddip finished")
-      # print(Sys.time())
+
+
 
       ################################################################################
       ################################################################################
@@ -342,65 +316,235 @@ with_progress({
       ################################################################################
       ################################################################################
       {
+        t_start <- Sys.time()
+        
         # split dataset
         split <- countsplit(
-          count_data,
+          t(count_data),
           epsilon=c(0.5, 0.5),
-          overdisps=rep(Inf, ncol(count_data)) # for Poisson
+          overdisps=rep(Inf, nrow(count_data)) # for Poisson
         )
-        data_clust <- split[[1]]
-        data_marker <- split[[2]]
+        data_clust <- t(split[[1]])
+        data_marker <- t(split[[2]])
 
         # clustering on one split
-        seurat_cluster <- CreateSeuratObject(counts=data_clust, assay="CLUSTER")
-        seurat_cluster <- NormalizeData(seurat_cluster, verbose=FALSE)
-        seurat_cluster <- FindVariableFeatures(seurat_cluster, verbose=FALSE)
-        seurat_cluster <- ScaleData(seurat_cluster, verbose=FALSE)
-        seurat_cluster <- RunPCA(seurat_cluster, verbose=FALSE)
-        seurat_cluster <- FindNeighbors(seurat_cluster, verbose=FALSE)
-        seurat_cluster <- FindNClusters(seurat_cluster, n_clusters=n_clusters)
-        countsplit_idents <- Idents(seurat_cluster)
+        countsplit_idents <- cluster_fn(data=data_clust, subsample_indices=NULL, cluster_args=cluster_args)
 
         # marker detection on other split
-        seurat_marker <- CreateSeuratObject(counts=data_marker, assay="MARKER")
-        seurat_marker$countsplit_idents <- countsplit_idents
-        Idents(seurat_marker) <- "countsplit_idents"
-        seurat_marker <- NormalizeData(seurat_marker, verbose=FALSE)
-
-        countsplit_cluster_ids <- levels(countsplit_idents)
         df_list <- list()
-        for(i in seq_along(countsplit_cluster_ids)){
-          for(j in seq_along(countsplit_cluster_ids)){
-
-            test_id1 <- countsplit_cluster_ids[i]
-
-            if(j < i){
-              next
-            } else if(i == j){
-              test_id2 <- NULL
-            } else{
-              test_id2 <- countsplit_cluster_ids[j]
-            }
-
-            markers <- FindMarkers(
-              seurat_marker, ident.1=test_id1, ident.2=test_id2, test.use="wilcox",
-              logfc.threshold=0.0, min.pct=0., # no pre-selection of genes
-              verbose=FALSE
-            )
-
-            markers$cluster1 <- test_id1
-            markers$cluster2 <- if(is.null(test_id2)) NA else test_id2
-            markers$marker <- rownames(markers)
-            rownames(markers) <- NULL
-
-            df_list[[length(df_list)+1]] <- markers
-          }
+        for(countsplit_id in levels(countsplit_idents)){
+          countsplit_cluster_markers <- marker_fn(
+            data=data_marker,
+            identities=countsplit_idents,
+            weights=NULL,
+            cluster_id1=countsplit_id,
+            cluster_id2=NULL,
+            marker_args=marker_args
+          )
+          df_list[[length(df_list)+1]] <- data.frame(
+            cluster1=countsplit_id,
+            cluster2=NA,
+            marker=names(countsplit_cluster_markers),
+            pval=countsplit_cluster_markers
+          )
         }
 
         countsplit_markers <- bind_rows(df_list)
+        rownames(countsplit_markers) <- NULL
+        # cat("Countsplit full", format(Sys.time() - t_start), "\n")
       }
-      # cat("csplit finished")
-      # print(Sys.time())
+
+
+      
+      ################################################################################
+      ################################################################################
+      ####                                                                        ####
+      ####                               ClusterDE                                ####
+      ####                                                                        ####
+      ################################################################################
+      ################################################################################
+      {
+        t_start <- Sys.time()
+        
+        # create null data and cluster it
+        # --> assumes single cluster under H0, may not hold for 1-vs-rest testing
+        null_data <- suppress_pois_check_warnings(suppressMessages(constructNull(
+          obj=CreateSeuratObject(counts=count_data),
+          family="poisson",
+          n_cores=blas_threads,
+          seed=seed+iter
+        )))
+        null_idents <- cluster_fn(data=null_data, subsample_indices=NULL, cluster_args=cluster_args)
+        
+        # real-null-cluster-mapping based on relative frequency
+        # matches power for real and null scenario
+        ddip_freq <- prop.table(table(ddip_idents))
+        null_freq <- prop.table(table(null_idents))
+        closest_idx <- vapply(
+          ddip_freq,
+          function(freq) which.min(abs(null_freq - freq)),
+          integer(1)
+        )
+        ddip_null_mapping <- data.frame(
+          ddip_id=transfer_dtype(x=names(ddip_freq), y=ddip_idents),
+          null_id=transfer_dtype(x=names(null_freq)[closest_idx], y=null_idents)
+        )
+        
+        # marker detection
+        df_list <- list()
+        for(ddip_id in levels(ddip_idents)){
+          
+          # testing on null data
+          null_id <- ddip_null_mapping %>% filter(ddip_id == !!ddip_id) %>% pull(null_id)
+          null_markers <- marker_fn(
+            data=null_data,
+            identities=null_idents,
+            weights=NULL,
+            cluster_id1=null_id,
+            cluster_id2=NULL,
+            marker_args=marker_args
+          )
+          
+          # error control step
+          withr::with_options(list(progress_enabled=FALSE), {
+                              
+            df_list[[length(df_list)+1]] <- callDE(
+              targetScores=ddip_markers %>%
+                filter(cluster1 == ddip_id) %>%
+                pull(pval, name=marker),
+              nullScores=null_markers
+            ) %>%
+              mutate(
+                cluster1=ddip_id,
+                cluster2=NA,
+                marker=gene,
+                pval=(-1 * (record >= 0.5)) + 1, # turn binary marker indicator into "pval"
+                .keep="none"
+              )
+            
+          })
+        }
+        
+        clusterde_markers <- bind_rows(df_list)
+        rownames(clusterde_markers) <- NULL
+        # cat("ClusterDE:", format(Sys.time() - t_start), "\n")
+      }
+      
+
+
+      ################################################################################
+      ################################################################################
+      ####                                                                        ####
+      ####                                TN test                                 ####
+      ####                                                                        ####
+      ################################################################################
+      ################################################################################
+      {
+        t_start <- Sys.time()
+        
+        # intialize Python
+        reticulate::use_virtualenv("./.venv", required=TRUE)
+        source("Scripts/helpers/python.R")
+        python_blas(1L) # parallelize via "n_cores" below
+        numpy <- reticulate::import("numpy", convert=TRUE)
+        numpy$random$seed(as.integer(seed + iter))
+
+        # split data
+        idx_split <- sample.int(n=n_cells, size=n_cells %/% 2, replace=FALSE)
+        counts_clust <- count_data[ ,  idx_split]
+        counts_test <- count_data[ , -idx_split]
+
+        # cluster on clustering split
+        tntest_idents_clust <- cluster_fn(data=counts_clust, subsample_indices=NULL, cluster_args=cluster_args)
+        tntest_ids <- unique(as.character(tntest_idents_clust))
+
+        tntest_idents <- rep(NA_character_, n_cells)
+        tntest_idents[idx_split] <- as.character(tntest_idents_clust)
+
+        # normalize data (required for Gaussian assumption)
+        X_clust <- CreateSeuratObject(counts=counts_clust) %>%
+          NormalizeData(normalization.method="LogNormalize", scale.factor=10000, verbose=FALSE) %>%
+          LayerData(layer="data") %>%
+          as.matrix() %>%
+          t()
+        X_test <- CreateSeuratObject(counts=counts_test) %>%
+          NormalizeData(normalization.method="LogNormalize", scale.factor=10000, verbose=FALSE) %>%
+          LayerData(layer="data") %>%
+          as.matrix() %>%
+          t()
+
+        # TN test 1-vs-rest (with reticulate for Python code)
+        # approximation since pooled "rest" is most likely not single Gaussian, but multimodal
+        success <- FALSE
+        df_list <- list()
+        tryCatch(
+          {
+            for(tntest_id in tntest_ids){
+              # construct binary label and class weights
+              idx_target_clust <- tntest_idents_clust == tntest_id
+              labels_clust <- factor(ifelse(idx_target_clust, "target", "rest"), levels=c("rest", "target"))
+    
+              n_total <- length(labels_clust)
+              n_target <- sum(idx_target_clust)
+              n_rest <- n_total - n_target
+              class_weights <- c(
+                rest=n_total / (2 * n_rest),
+                target=n_total / (2 * n_target)
+              )
+    
+              # fit single class svm and recover hyperplane
+              # decision(x)=X %*% w + intercept
+              singleclass_svm <- e1071::svm(
+                x=X_clust,
+                y=labels_clust,
+                type="C-classification",
+                kernel="linear",
+                cost=100,
+                scale=FALSE,
+                class.weights=class_weights
+              )
+              w <- drop(t(singleclass_svm$coefs) %*% singleclass_svm$SV)
+              intercept <- -as.numeric(singleclass_svm$rho)
+    
+              # hyper plane orientation
+              pred_target <- as.character(predict(singleclass_svm, newdata=X_clust)) == "target"
+              score_clust <- X_clust %*% w + intercept
+              agreement <- mean((score_clust > 0 ) == pred_target)
+              agreement_flipped <- mean((score_clust <= 0 ) == pred_target)
+              if(agreement_flipped > agreement){
+                w <- -1 * w
+                intercept <- -1 * intercept
+              }
+              score_test <- drop(X_test %*% w + intercept)
+              idx_target_test <- score_test > 0
+    
+              # perform TN test in Python
+              pval <- tn_python(inner_threads=1L)$tn_test(
+                  y=X_test[!idx_target_test, , drop=FALSE],
+                  z=X_test[idx_target_test, , drop=FALSE],
+                  a=numpy$asarray(w),
+                  b=intercept,
+                  verbose=FALSE,
+                  num_iters=100000L,
+                  num_cores=as.integer(blas_threads)
+                )
+    
+              df_list[[length(df_list) + 1]] <- data.frame(
+                cluster1=tntest_id,
+                cluster2=NA,
+                marker=colnames(X_test),
+                pval=p.adjust(pval, method="bonferroni")
+              )
+            }
+            success <- TRUE
+          },
+          finally=try(shutdown_joblib(kill_workers=!success), silent=TRUE)
+        )
+        tntest_markers <- bind_rows(df_list)
+        # cat("TN Test:"; format(Sys.time() - t_start), "\n")
+      }
+
+
 
       ################################################################################
       ################################################################################
@@ -410,35 +554,37 @@ with_progress({
       ################################################################################
       ################################################################################
 
-      stabcell_results <- StabCell(
-        data=count_data,
-        reference_identities=seurat_idents,
-        cluster_fn=cluster_fn,
-        test_fn=test_fn,
-        cluster_args=NULL,
-        test_args=NULL,
-        p_value_threshold=p_value_threshold,
-        n_subsample_markers=n_subsample_markers,
-        PFER_max=PFER_max,
-        test_global=TRUE,
-        test_local=test_local,
-        cell_stability_metric=cell_stability_metric,
-        subsampling_iterations=subsampling_iterations,
-        subsampling_fraction=subsampling_fraction,
-        complementary_pairs=complementary_pairs,
-        ranking="p_val",
-        assumption=c("none", "unimodal", "r_concavity"),
-        theta=NULL,
-        steps_to_run=NULL,
-        cells_in_columns=TRUE,
-        checkpoint_path=NULL,
-        checkpoint=NULL,
-        packages=c("Seurat"),    # packages that are needed for clustering or testing
-        export=c("FindNClusters", "n_clusters"),   # additional custom objects needed for clustering or testing
-        verbose=FALSE
-      )
-      # cat("stabcell finished")
-      # print(Sys.time())
+      without_progress({
+        t_start <- Sys.time()
+        stabcell_results <- StabCell(
+          data=count_data,
+          cluster_fn=cluster_fn,
+          PFER_max=PFER_max,
+          reference_identities=ddip_idents,
+          marker_fn=marker_fn,
+          p_value_threshold=p_value_threshold,
+          n_subsample_markers=n_subsample_markers,
+          cluster_args=cluster_args,
+          marker_args=marker_args,
+          marker_global=TRUE,
+          marker_local=FALSE,
+          subsampling_iterations=subsampling_iterations,
+          subsampling_fraction=0.5,
+          complementary_pairs=TRUE,
+          cell_stability_metric=cell_stability_metric,
+          assumption=c("none", "unimodal", "r_concavity"),
+          ranking="p_val",
+          theta=NULL,
+          cells_in_columns=TRUE,
+          packages=c("Seurat"),        # packages that are needed for clustering or testing
+          export=c("FindNClusters"),   # additional custom objects needed for clustering or testing
+          steps_to_run=NULL,
+          checkpoint_path=NULL,
+          checkpoint=NULL,
+          verbose=FALSE
+        )
+        # cat("StabCell:", format(Sys.time() - t_start), "\n")
+      })
 
       ######################
       #### save results ####
@@ -447,23 +593,33 @@ with_progress({
       results <- list(
         config=list(
           n_celltypes=n_celltypes,
-          lib.loc=lib.loc,
+          lib.size=lib.size,
           de.prob=de.prob,
           de.facLoc=de.facLoc,
-          subsampling_fraction=subsampling_fraction,
-          complementary_pairs=complementary_pairs,
           n_iterations=subsampling_iterations
         ),
-        count_data=count_data,
-        true_fold_changes=true_fold_changes,
-        true_idents=true_idents,
+        sim=list(
+          count_data=count_data,
+          true_idents=true_idents,
+          true_fold_changes=true_fold_changes
+        ),
+        oracle=list(
+          markers=oracle_markers
+        ),
         double_dipping=list(
-          markers=double_dipping_markers,
-          identities=seurat_idents
+          markers=ddip_markers,
+          identities=ddip_idents
         ),
         countsplit=list(
           markers=countsplit_markers,
           identities=countsplit_idents
+        ),
+        clusterde=list(
+          markers=clusterde_markers
+        ),
+        tntest=list(
+          markers=tntest_markers,
+          identities=tntest_idents
         ),
         stabcell=stabcell_results
       )
@@ -474,12 +630,8 @@ with_progress({
       return(NULL)
     }
 
-    print(summary(warnings()))
     cat(paste0("finished at ", strftime(Sys.time())), "\n")
   }
 })
 
-
-
-
-
+print(summary(warnings()))

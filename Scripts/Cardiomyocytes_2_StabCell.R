@@ -7,6 +7,8 @@ library(progressr)
 
 library(StabCell)
 
+warning("This script was run with StabCell version 0.1.0. The API and return value have slightly changed since then!")
+
 
 options(future.globals.maxSize=10 * 1024^3)
 

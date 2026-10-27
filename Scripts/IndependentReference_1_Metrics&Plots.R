@@ -6,6 +6,8 @@ library(dplyr)
 library(ggplot2)
 library(patchwork)
 
+source("Scripts/helpers/metrics.R")
+
 blas_threads <- 8
 num_workers <- 25
 
@@ -25,62 +27,9 @@ my_colors <- c(
 
 blas_set_num_threads(blas_threads)
 options(future.globals.maxSize=16 * 1024^3)
-plan(multicore, workers=num_workers)
+plan(multisession, workers=num_workers)
 registerDoFuture()
 
-
-calculate_metrics <- function(
-  selected_markers,
-  unselected_markers,
-  true_markers,
-  false_markers
-){
-  n_markers <- length(selected_markers)
-  tp_markers <- length(intersect(selected_markers, true_markers))
-  fp_markers <- length(intersect(selected_markers, false_markers))
-  tn_markers <- length(intersect(unselected_markers, false_markers))
-  fn_markers <- length(intersect(unselected_markers, true_markers))
-
-  accuracy <- (tp_markers + tn_markers) / (tp_markers + tn_markers + fp_markers + fn_markers)
-  precision <- tp_markers / (tp_markers + fp_markers)
-  recall <- tp_markers / (tp_markers + fn_markers)
-  true_negative_rate <- tn_markers / (tn_markers + fp_markers)
-  F1_score <- precision * recall / (precision + recall)
-
-  results <- data.frame(
-    n_markers=n_markers,
-    tp_markers=tp_markers,
-    fp_markers=fp_markers,
-    tn_markers=tn_markers,
-    fn_markers=fn_markers,
-    accuracy=accuracy,
-    precision=precision,
-    recall=recall,
-    true_negative_rate=true_negative_rate,
-    F1_score=F1_score
-  )
-
-  return(results)
-}
-
-top_k_marker_agreement <- function(
-  true_log_fold_changes,
-  log_fold_changes,
-  k,
-  seurat=FALSE
-){
-
-  if(nrow(true_log_fold_changes) == 0) return(NA)
-
-  top_k_truth <- (true_log_fold_changes %>% arrange(desc(abs(lfc))))[1:k, "marker"]
-  if(seurat){
-    top_k_stable <- (log_fold_changes %>% arrange(desc(abs(avg_log2FC))))[1:k, "marker"]
-  } else {
-    top_k_stable <- (log_fold_changes %>% arrange(desc(abs(lfc_mean))))[1:k, "marker"]
-  }
-  agreement <- length(intersect(top_k_truth, top_k_stable)) / k
-  return(agreement)
-}
 
 find_closest_cluster <- StabCell:::find_closest_cluster
 
@@ -163,7 +112,7 @@ if(file.exists(results_file)){
       split_markers <- results$with_split$stable_markers_global
 
       # "without split" results
-      nosplit_idents <- results$no_split$clustering_mode
+      nosplit_idents <- results$no_split$stable_clustering
       nosplit_markers <- results$no_split$stable_markers_global
 
 
@@ -284,17 +233,17 @@ if(file.exists(results_file)){
               ),
               top1_agreement=top_k_marker_agreement(
                 true_log_fold_changes=true_markers_df,
-                log_fold_changes=selected_markers_df,
+                method_marker_df=selected_markers_df,
                 k=1
               ),
               top5_agreement=top_k_marker_agreement(
                 true_log_fold_changes=true_markers_df,
-                log_fold_changes=selected_markers_df,
+                method_marker_df=selected_markers_df,
                 k=5
               ),
               top10_agreement=top_k_marker_agreement(
                 true_log_fold_changes=true_markers_df,
-                log_fold_changes=selected_markers_df,
+                method_marker_df=selected_markers_df,
                 k=10
               )
             )
@@ -308,7 +257,7 @@ if(file.exists(results_file)){
         if(method == "split"){
           df_metrics <- df_metrics %>%
             left_join(method_alignment_df, by=c("id"="split_id")) %>%
-            rename(split_id=id, id=nosplit_id)
+            dplyr::rename(split_id=id, id=nosplit_id)
         } else {
           df_metrics <- df_metrics %>%
             left_join(method_alignment_df, by=c("id"="nosplit_id"))
@@ -483,7 +432,7 @@ ggsave(
 )
 ggsave(
   plot=p,
-  filename="IndependentReference.tif",
+  filename="IndependentReference.jpg",
   path=plot_dir,
   width=17, height=7, unit="cm", dpi=350
 )

@@ -63,17 +63,7 @@ permute_levels <- function(x) {
   }
   levels(x) <- sample(levels(x))
   return(x)
-  
-  # original_levels <- levels(x)
-  # permuted_levels <- sample(original_levels)
-  # 
-  # # Create a named mapping
-  # level_map <- setNames(permuted_levels, original_levels)
-  # 
-  # # Apply the mapping to the values
-  # new_values <- level_map[as.character(x)]
-  # 
-  # factor(new_values, levels = original_levels)
+
 }
 
 palette <- my_colors[c(1, 6, 2, 8)]

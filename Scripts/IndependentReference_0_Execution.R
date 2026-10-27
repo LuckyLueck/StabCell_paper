@@ -1,3 +1,5 @@
+setwd("/mnt/mikasa_data/nlueck/StabCell_paper")
+
 library(RhpcBLASctl)
 library(doRNG)
 library(doFuture)
@@ -9,6 +11,8 @@ library(splatter)
 library(Seurat)
 library(countsplit)
 library(StabCell)
+source("Scripts/helpers/cluster_fn.R")
+source("Scripts/helpers/marker_fn.R")
 
 ################
 #### config ####
@@ -31,45 +35,6 @@ PFER_max <- 25
 assumption <- c("none", "unimodal", "r_concavity")
 
 repetitions <- 100
-
-cluster_fn <- function(data, subsample_indices, cluster_args=NULL){
-  seurat_obj <- CreateSeuratObject(counts=data)
-  seurat_obj <- NormalizeData(seurat_obj, verbose=FALSE)
-  seurat_obj <- FindVariableFeatures(seurat_obj, verbose=FALSE)
-  seurat_obj <- ScaleData(seurat_obj, verbose=FALSE)
-  seurat_obj <- RunPCA(seurat_obj, verbose=FALSE)
-  seurat_obj <- FindNeighbors(seurat_obj, verbose=FALSE)
-  seurat_obj <- FindClusters(seurat_obj, verbose=FALSE)
-  identities <- as.numeric(Idents(seurat_obj))
-  return(identities)
-}
-
-test_fn <- function(data, identities, weights, test_id1, test_id2=NULL, test_args=NULL){
-  # cannot test cluster against itself
-  # --> check for cluster collision
-  if((!is.null(test_id2)) && (test_id1 == test_id2)){
-    p_values <- rep(1., nrow(data))
-    names(p_values) <- rownames(data)
-    return(p_values)
-  } else {
-    # prepare seurat object
-    seurat_obj <- CreateSeuratObject(counts=data)
-    seurat_obj <- NormalizeData(seurat_obj, verbose=FALSE)
-    Idents(seurat_obj) <- identities
-
-    markers <- FindMarkers(
-      seurat_obj, ident.1=test_id1, ident.2=test_id2, test.use="wilcox",
-      logfc.threshold=0.0, min.pct=0., # no pre-selection of genes
-      verbose=FALSE
-    )
-
-    # format results
-    p_values <- markers$p_val_adj
-    names(p_values) <- rownames(markers)
-  }
-
-  return(p_values)
-}
 
 
 sim_grid <- expand.grid(iter=1:repetitions) %>%
@@ -142,8 +107,7 @@ with_progress({
         method="groups",
         verbose=FALSE
       )
-      count_data <- counts(sim)
-      count_data <- as(count_data, "CsparseMatrix")
+      count_data <- as(counts(sim), "CsparseMatrix")
       true_idents <- as.numeric(substr(colData(sim)$Group, 6, 10))
       true_fold_changes <- as.data.frame(rowData(sim)[startsWith(colnames(rowData(sim)), "DEFacGroup")])
     }
@@ -161,21 +125,27 @@ with_progress({
     # without splitting
     {
       reference_idents_nosplit <- cluster_fn(count_data, NULL)
-      stabcell_results_no_split <- StabCell(
-        data=count_data,
-        reference_identities=reference_idents_nosplit,
-        cluster_fn=cluster_fn,
-        test_fn=test_fn,
-        cluster_args=NULL,
-        test_args=NULL,
-        p_value_threshold=0.05,
-        subsampling_iterations=B,
-        PFER_max=PFER_max,
-        assumption=assumption,
-        packages=c("Seurat"),    # packages that are needed for clustering or testing
-        verbose=FALSE
-      )
-      stabcell_results_no_split[["reference_idents"]] <- reference_idents_nosplit
+      without_progress({
+        stabcell_results_no_split <- StabCell(
+          data=count_data,
+          cluster_fn=cluster_fn,
+          PFER_max=PFER_max,
+          reference_identities=reference_idents_nosplit,
+          marker_fn=marker_fn,
+          p_value_threshold=0.05,
+          cluster_args=NULL,
+          marker_args=NULL,
+          marker_global=TRUE,
+          marker_local=FALSE,
+          subsampling_iterations=B,
+          subsampling_fraction=0.5,
+          complementary_pairs=TRUE,
+          assumption=assumption,
+          cells_in_columns=TRUE,
+          packages=c("Seurat"),
+          verbose=FALSE
+        )
+      })
     }
 
     # with splitting for clustering and marker detection
@@ -240,34 +210,37 @@ with_progress({
       }
 
       # perform marker detection in subsamples
-      marker_alignment <- MarkerStabilityAlignment(
-        reference_identities=marker_idents,
-        subsampling_identities=subsampling_identities
-      )
-      subsampling_p_values <- SubsampleTesting(
-        data=count_data_marker,
-        reference_identities=marker_idents,
-        subsampling_identities=subsampling_identities,
-        marker_alignment=marker_alignment,
-        cell_stability_score=NULL,
-        test_fn=test_fn,
-        packages="Seurat",
-        verbose=FALSE
-      )
-
-      # find stable markers
-      selection_frequencies <- CalculateSelectionFrequency(
-        subsampling_p_values=subsampling_p_values,
-        p_value_threshold=0.05,
-        n_subsample_markers=NULL
-      )
-      stable_markers_global <- FindAllGlobalStableMarkers(
-        selection_frequencies=selection_frequencies,
-        PFER_max=PFER_max,
-        assumption=assumption,
-        B=B,
-        theta=NULL
-      )
+      without_progress({
+        marker_alignment <- MarkerStabilityAlignment(
+          reference_identities=marker_idents,
+          subsampling_identities=subsampling_identities
+        )
+        subsampling_p_values <- SubsampleMarkers(
+          data=count_data_marker,
+          reference_identities=marker_idents,
+          subsampling_identities=subsampling_identities,
+          marker_alignment=marker_alignment,
+          cell_stability_score=NULL,
+          marker_fn=marker_fn,
+          marker_args=NULL,
+          packages="Seurat",
+          verbose=FALSE
+        )
+  
+        # find stable markers
+        marker_selection_frequencies <- CalculateMarkerSelectionFrequency(
+          subsampling_p_values=subsampling_p_values,
+          p_value_threshold=0.05,
+          n_subsample_markers=NULL
+        )
+        stable_markers_global <- FindAllGlobalStableMarkers(
+          marker_selection_frequencies=marker_selection_frequencies,
+          PFER_max=PFER_max,
+          assumption=assumption,
+          B=B,
+          theta=NULL
+        )
+      })
 
       stabcell_results_with_split <- list(
         idx_split=idx_split,
@@ -275,61 +248,11 @@ with_progress({
         marker_idents=marker_idents,
         subsample_idents=subsampling_identities,
         subsampling_p_values=subsampling_p_values,
-        selection_frequencies=selection_frequencies,
+        marker_selection_frequencies=marker_selection_frequencies,
         stable_markers_global=stable_markers_global
       )
     }
 
-    #### diagnostics ####
-
-    # split_idents <- rep(NA, ncol(count_data))
-    # split_idents[idx_split] <- clustering_idents
-    # split_idents[-idx_split] <- marker_idents
-    #
-    # table(reference_idents_nosplit, true_idents)
-    # table(stabcell_results_no_split$clustering_mode, true_idents)
-    # table(split_idents, true_idents)
-    # {
-    #   # select ids corresponding to true_ident == 1
-    #   seurat_id <- 5
-    #   stabcell_id <- 5
-    #   split_id <- 2
-    #
-    #   # select correct DEFacGroup!!!
-    #   true_markers <- rownames(true_fold_changes %>% select(DEFacGroup1) %>% filter(DEFacGroup1 != 1))
-    #   false_markers <- setdiff(rownames(count_data), true_markers)
-    #
-    #   seurat_marker <- test_fn(count_data, reference_idents_nosplit, test_id1=seurat_id)
-    #   seurat_marker <- names(seurat_marker[seurat_marker <= 0.05])
-    #   fp_markers_seurat <- length(intersect(false_markers, seurat_marker))
-    #   tp_markers_seurat <- length(intersect(true_markers, seurat_marker))
-    #
-    #   stabcell_marker <- (stabcell_results_no_split$stable_markers_global %>% filter(id == !!stabcell_id))$marker
-    #   fp_markers_stabcell <- length(intersect(false_markers, stabcell_marker))
-    #   tp_markers_stabcell <- length(intersect(true_markers, stabcell_marker))
-    #
-    #   split_marker <- (stabcell_results_with_split$stable_markers_global %>% filter(id == !!split_id))$marker
-    #   fp_markers_split <- length(intersect(false_markers, split_marker))
-    #   tp_markers_split <- length(intersect(true_markers, split_marker))
-    #
-    #
-    #   c(
-    #     FP_seurat=fp_markers_seurat,
-    #     TP_seurat=tp_markers_seurat,
-    #     FP_stabcell=fp_markers_stabcell,
-    #     TP_stabcell=tp_markers_stabcell,
-    #     FP_split=fp_markers_split,
-    #     TP_split=tp_markers_split
-    #   )
-    # }
-    # plotfn <- function(coords, idents){
-    #    ggplot(
-    #          data=as.data.frame(coords),
-    #          mapping=aes(x=PC_1, y=PC_2, color=idents)
-    #      ) +
-    #          geom_point(size=0.1)
-    # }
-    # plotfn(clustering_embeddings, as.factor(clustering_idents)) + plotfn(marker_embeddings, marker_idents)
 
     ######################
     #### save results ####
